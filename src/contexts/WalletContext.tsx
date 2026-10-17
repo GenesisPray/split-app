@@ -17,12 +17,18 @@ export function WalletProvider({ children }: { children: ReactNode }) {
   const wallet = useWallet();
   const sep10 = useSep10Auth();
 
-  // Auto-authenticate when a wallet address becomes available
+  // Auto-authenticate when the active wallet address becomes available.
+  // Keying off activeAddress ensures switching wallets re-authenticates.
   useEffect(() => {
-    if (wallet.address && !sep10.isAuthenticated && !sep10.isAuthenticating) {
-      sep10.authenticate(wallet.address);
+    if (wallet.activeAddress && !sep10.isAuthenticated && !sep10.isAuthenticating) {
+      sep10.authenticate(wallet.activeAddress);
     }
-  }, [wallet.address, sep10.isAuthenticated, sep10.isAuthenticating, sep10.authenticate]);
+  }, [
+    wallet.activeAddress,
+    sep10.isAuthenticated,
+    sep10.isAuthenticating,
+    sep10.authenticate,
+  ]);
 
   const value: WalletContextValue = { ...wallet, sep10 };
 
