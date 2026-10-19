@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { useWalletContext } from "@/contexts/WalletContext";
 import { truncateAddress, formatAmount } from "@stellar-split/sdk";
 import { fetchUsdcBalance } from "@/lib/stellar";
@@ -8,6 +8,24 @@ import QRModal from "@/components/QRModal";
 import WalletErrorModal, { type WalletErrorType } from "@/components/WalletErrorModal";
 import { useToast } from "@/contexts/ToastContext";
 import { useUserPreferences } from "@/contexts/UserPreferencesContext";
+
+/** Connection status surfaced by the WalletConnect v2 flow. */
+type WcStatus =
+  | "idle"
+  | "awaiting_scan"
+  | "connecting"
+  | "connected"
+  | "retrying"
+  | "error";
+
+const WC_STATUS_LABEL: Record<WcStatus, string> = {
+  idle: "",
+  awaiting_scan: "Waiting for wallet to scan the QR code…",
+  connecting: "Connecting to mobile wallet…",
+  connected: "Connected",
+  retrying: "Connection timed out — retrying…",
+  error: "Connection failed",
+};
 
 interface Props {
   /** Smaller footprint for the sticky header nav: address badge + single connect button, no balance line. */
@@ -49,9 +67,30 @@ export default function WalletConnect({ compact = false }: Props) {
   const [balanceLoading, setBalanceLoading] = useState(false);
   const [qrOpen, setQrOpen] = useState(false);
   const [qrUri, setQrUri] = useState<string>("");
-  const [selectorOpen, setSelectorOpen] = useState(false);
+  const [wcStatus, setWcStatus] = useState<WcStatus>("idle");
+  const [wcError, setWcError] = useState<WalletErrorType>(null);
+  const [wcRetryable, setWcRetryable] = useState(false);
+  const retryTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   const USDC_CONTRACT_ID = process.env.NEXT_PUBLIC_USDC_ADDRESS ?? "";
+
+  // Clear any pending retry timer on unmount.
+  useEffect(() => {
+    return () => {
+      if (retryTimerRef.current) clearTimeout(retryTimerRef.current);
+    };
+  }, []);
+
+  // Reflect the context's WalletConnect session status in local UI state.
+  useEffect(() => {
+    if (walletType !== "walletconnect") return;
+    if (address) {
+      setWcStatus("connected");
+      setWcError(null);
+      setWcRetryable(false);
+      setQrOpen(false);
+    }
+  }, [walletType, address]);
 
   useEffect(() => {
     if (!address || !USDC_CONTRACT_ID) {
@@ -94,19 +133,54 @@ export default function WalletConnect({ compact = false }: Props) {
   };
 
   const handleConnectWalletConnect = async () => {
-    setPreferredWalletType("walletconnect");
+    if (retryTimerRef.current) {
+      clearTimeout(retryTimerRef.current);
+      retryTimerRef.current = null;
+    }
+    setWcError(null);
+    setWcRetryable(false);
+    setWcStatus("connecting");
     try {
       const result = await connect("walletconnect");
       if (result && "uri" in result && result.uri) {
         setQrUri(result.uri);
         setQrOpen(true);
+        setWcStatus("awaiting_scan");
+      } else {
+        // No pairing URI returned — treat as a failed session start.
+        setWcStatus("error");
+        setWcError("not_installed");
+        setWcRetryable(true);
       }
     } catch (e) {
-      // error is surfaced via context state
       const errType = classifyWalletError(e);
-      setRetryAction(() => handleConnectWalletConnect);
-      setModalError(errType);
+      setWcStatus("error");
+      setWcError(errType);
+      setWcRetryable(true);
+      if (errType === "rejected") {
+        toast.error("WalletConnect request rejected. Try again when you're ready.");
+      } else {
+        toast.error("Could not initiate WalletConnect. Please try again.");
+      }
       console.error(e);
+    }
+  };
+
+  const handleWcRetry = () => {
+    setWcStatus("retrying");
+    setWcError(null);
+    setWcRetryable(false);
+    // Brief delay so the retrying state is visible before re-initiating.
+    retryTimerRef.current = setTimeout(() => {
+      retryTimerRef.current = null;
+      void handleConnectWalletConnect();
+    }, 600);
+  };
+
+  const handleWcClose = () => {
+    setQrOpen(false);
+    if (wcStatus === "awaiting_scan" || wcStatus === "connecting") {
+      setWcStatus("idle");
     }
   };
 
@@ -348,21 +422,55 @@ export default function WalletConnect({ compact = false }: Props) {
 
         <button
           onClick={handleConnectWalletConnect}
-          disabled={connecting}
+          disabled={connecting || wcStatus === "connecting" || wcStatus === "retrying"}
           className="min-h-11 px-6 py-3 rounded-lg bg-gray-50 dark:bg-gray-900 hover:bg-gray-100 dark:hover:bg-gray-800 font-semibold transition-colors disabled:opacity-50 border border-gray-200 dark:border-gray-800 focus:outline-none focus-visible:ring-2 focus-visible:ring-indigo-500"
-          aria-label="Connect with WalletConnect"
+          aria-label="Connect with mobile wallet via WalletConnect"
         >
-          {connecting ? "Connecting…" : "Connect with WalletConnect"}
+          {wcStatus === "connecting" || wcStatus === "retrying"
+            ? "Connecting…"
+            : "Connect with mobile wallet"}
         </button>
       </div>
 
       {error && <p className="text-red-400 text-xs">Could not connect wallet.</p>}
 
+      {wcStatus !== "idle" && wcStatus !== "connected" && (
+        <div
+          className="flex items-center gap-2 text-xs text-gray-500 dark:text-gray-400"
+          role="status"
+          aria-live="polite"
+        >
+          {(wcStatus === "awaiting_scan" ||
+            wcStatus === "connecting" ||
+            wcStatus === "retrying") && (
+            <span
+              className="inline-block h-3 w-3 animate-spin rounded-full border-2 border-gray-400 border-t-transparent"
+              aria-hidden="true"
+            />
+          )}
+          <span className={wcStatus === "error" ? "text-red-400" : undefined}>
+            {WC_STATUS_LABEL[wcStatus]}
+          </span>
+          {wcStatus === "error" && wcRetryable && (
+            <button
+              onClick={handleWcRetry}
+              className="min-h-11 rounded-lg bg-gray-200 dark:bg-gray-700 hover:bg-gray-300 dark:hover:bg-gray-600 px-3 py-1.5 text-xs font-semibold transition-colors focus:outline-none focus-visible:ring-2 focus-visible:ring-indigo-500"
+              aria-label="Retry WalletConnect connection"
+            >
+              Retry
+            </button>
+          )}
+        </div>
+      )}
+
       <QRModal
         open={qrOpen}
         uri={qrUri}
-        onClose={() => setQrOpen(false)}
-        onConnected={() => setQrOpen(false)}
+        onClose={handleWcClose}
+        onConnected={() => {
+          setWcStatus("connected");
+          setQrOpen(false);
+        }}
       />
 
       <WalletErrorModal
@@ -376,6 +484,15 @@ export default function WalletConnect({ compact = false }: Props) {
           const action = retryAction;
           setRetryAction(null);
           action?.();
+        }}
+      />
+
+      <WalletErrorModal
+        errorType={wcError}
+        onDismiss={() => setWcError(null)}
+        onRetry={() => {
+          setWcError(null);
+          handleWcRetry();
         }}
       />
     </div>

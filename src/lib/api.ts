@@ -77,3 +77,235 @@ export async function apiFetch(
 
   return fetch(input, init);
 }
+
+/* -------------------------------------------------------------------------- */
+/*                          Co-signer API helpers                             */
+/* -------------------------------------------------------------------------- */
+
+/** Approval state of a single co-signer. */
+export type CoSignerStatus = "pending" | "approved";
+
+/** A single required co-signer on an invoice. */
+export interface CoSigner {
+  /** Stellar address of the co-signer. */
+  address: string;
+  /** Current approval state. */
+  status: CoSignerStatus;
+  /** Optional signature payload submitted on approval. */
+  signature?: string;
+  /** ISO timestamp of when the co-signer approved, if applicable. */
+  approvedAt?: string;
+}
+
+/** Shape returned by `fetchCoSigners`. */
+export interface CoSignerState {
+  cosigners: CoSigner[];
+  cosignerThreshold: number;
+}
+
+/** Classified error thrown by the co-signer helpers. */
+export class CoSignerApiError extends Error {
+  /** HTTP status code, or 0 for network/parse failures. */
+  readonly status: number;
+  /** Machine-readable error classification. */
+  readonly code:
+    | "network"
+    | "unauthorized"
+    | "forbidden"
+    | "not_found"
+    | "conflict"
+    | "rate_limited"
+    | "server"
+    | "parse"
+    | "unknown";
+
+  constructor(
+    message: string,
+    status: number,
+    code: CoSignerApiError["code"]
+  ) {
+    super(message);
+    this.name = "CoSignerApiError";
+    this.status = status;
+    this.code = code;
+  }
+}
+
+function classifyStatus(status: number): CoSignerApiError["code"] {
+  if (status === 401) return "unauthorized";
+  if (status === 403) return "forbidden";
+  if (status === 404) return "not_found";
+  if (status === 409) return "conflict";
+  if (status === 429) return "rate_limited";
+  if (status >= 500) return "server";
+  return "unknown";
+}
+
+async function readErrorMessage(response: Response): Promise<string> {
+  try {
+    const body = await response.json();
+    if (body && typeof body.error === "string") return body.error;
+    if (body && typeof body.message === "string") return body.message;
+  } catch {
+    /* ignore parse failures */
+  }
+  return `Request failed with status ${response.status}`;
+}
+
+function normalizeCoSigner(raw: unknown): CoSigner {
+  const record = (raw ?? {}) as Record<string, unknown>;
+  const status = record.status === "approved" ? "approved" : "pending";
+  return {
+    address: typeof record.address === "string" ? record.address : "",
+    status,
+    signature:
+      typeof record.signature === "string" ? record.signature : undefined,
+    approvedAt:
+      typeof record.approvedAt === "string" ? record.approvedAt : undefined,
+  };
+}
+
+/**
+ * Fetch the co-signer list and threshold for an invoice.
+ *
+ * Reads `splitMeta.cosigners` and `splitMeta.cosignerThreshold` from
+ * `GET /api/invoices/:id`.
+ */
+export async function fetchCoSigners(
+  invoiceId: string
+): Promise<CoSignerState> {
+  let response: Response;
+  try {
+    response = await apiFetch(`/api/invoices/${encodeURIComponent(invoiceId)}`);
+  } catch (err) {
+    throw new CoSignerApiError(
+      err instanceof Error ? err.message : "Network request failed",
+      0,
+      "network"
+    );
+  }
+
+  if (!response.ok) {
+    throw new CoSignerApiError(
+      await readErrorMessage(response),
+      response.status,
+      classifyStatus(response.status)
+    );
+  }
+
+  let body: unknown;
+  try {
+    body = await response.json();
+  } catch {
+    throw new CoSignerApiError(
+      "Failed to parse invoice response",
+      response.status,
+      "parse"
+    );
+  }
+
+  const splitMeta =
+    body && typeof body === "object"
+      ? ((body as Record<string, unknown>).splitMeta as
+          | Record<string, unknown>
+          | undefined)
+      : undefined;
+
+  const rawCosigners = Array.isArray(splitMeta?.cosigners)
+    ? (splitMeta!.cosigners as unknown[])
+    : [];
+  const threshold =
+    typeof splitMeta?.cosignerThreshold === "number"
+      ? splitMeta.cosignerThreshold
+      : 0;
+
+  return {
+    cosigners: rawCosigners.map(normalizeCoSigner),
+    cosignerThreshold: threshold,
+  };
+}
+
+/**
+ * Submit an approval for a co-signer by patching the invoice's `splitMeta`.
+ *
+ * Sends `PATCH /api/invoices/:id` with the updated co-signer entry. The
+ * caller is responsible for passing the full current list via `cosigners`
+ * when the backend requires a full replacement; otherwise only the approving
+ * address is sent.
+ */
+export async function submitCoSignerApproval(
+  invoiceId: string,
+  address: string,
+  signature?: string,
+  cosigners?: CoSigner[]
+): Promise<CoSignerState> {
+  const approvedEntry: CoSigner = {
+    address,
+    status: "approved",
+    signature,
+    approvedAt: new Date().toISOString(),
+  };
+
+  const nextCosigners = cosigners
+    ? cosigners.map((c) => (c.address === address ? approvedEntry : c))
+    : [approvedEntry];
+
+  let response: Response;
+  try {
+    response = await apiFetch(
+      `/api/invoices/${encodeURIComponent(invoiceId)}`,
+      {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          splitMeta: { cosigners: nextCosigners },
+        }),
+      }
+    );
+  } catch (err) {
+    throw new CoSignerApiError(
+      err instanceof Error ? err.message : "Network request failed",
+      0,
+      "network"
+    );
+  }
+
+  if (!response.ok) {
+    throw new CoSignerApiError(
+      await readErrorMessage(response),
+      response.status,
+      classifyStatus(response.status)
+    );
+  }
+
+  let body: unknown;
+  try {
+    body = await response.json();
+  } catch {
+    throw new CoSignerApiError(
+      "Failed to parse approval response",
+      response.status,
+      "parse"
+    );
+  }
+
+  const splitMeta =
+    body && typeof body === "object"
+      ? ((body as Record<string, unknown>).splitMeta as
+          | Record<string, unknown>
+          | undefined)
+      : undefined;
+
+  const rawCosigners = Array.isArray(splitMeta?.cosigners)
+    ? (splitMeta!.cosigners as unknown[])
+    : nextCosigners;
+  const threshold =
+    typeof splitMeta?.cosignerThreshold === "number"
+      ? splitMeta.cosignerThreshold
+      : 0;
+
+  return {
+    cosigners: rawCosigners.map(normalizeCoSigner),
+    cosignerThreshold: threshold,
+  };
+}
